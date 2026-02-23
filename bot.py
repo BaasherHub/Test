@@ -1,18 +1,21 @@
 """
-CTST (Claude Test) Pump.fun Market Maker Bot
+CTST (Claude Test) Market Maker Bot
 Token: 7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump
+Uses PumpPortal API for trading - https://pumpportal.fun
 """
 
 import os
 import time
+import base58
 import requests
 import logging
 from datetime import datetime
 from solana.rpc.api import Client
+from solana.rpc.types import TxOpts
 from solders.keypair import Keypair  # type: ignore
-from pump_fun import buy, sell
+from solders.transaction import VersionedTransaction  # type: ignore
 
-# ─── Logging Setup ────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,155 +26,172 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Config (loaded from environment variables) ────────────────────────────────
-PRIVATE_KEY   = os.environ["PRIVATE_KEY"]        # Base58 string of your bot wallet
-RPC_URL       = os.environ["RPC_URL"]            # e.g. Helius RPC URL
-MINT          = "7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump"
+# ─── Config ───────────────────────────────────────────────────────────────────
+PRIVATE_KEY      = os.environ["PRIVATE_KEY"]   # Base58 private key of bot wallet
+RPC_URL          = os.environ["RPC_URL"]        # Helius or QuickNode RPC URL
+MINT             = "7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump"
 
-# Strategy settings
-BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.005"))   # SOL per buy
-SELL_PERCENT     = float(os.getenv("SELL_PERCENT", "50"))          # % of tokens to sell each cycle
-SLIPPAGE         = int(os.getenv("SLIPPAGE", "10"))               # % slippage tolerance
-CYCLE_SECONDS    = int(os.getenv("CYCLE_SECONDS", "60"))          # seconds between cycles
-PROFIT_TARGET    = float(os.getenv("PROFIT_TARGET", "20"))        # % gain to trigger sell
-UNIT_BUDGET      = 200_000
-UNIT_PRICE       = 1_000_000
+BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.005"))
+PROFIT_TARGET    = float(os.getenv("PROFIT_TARGET", "20"))     # % gain to sell
+STOP_LOSS        = float(os.getenv("STOP_LOSS", "30"))         # % loss to cut
+SELL_PERCENT     = os.getenv("SELL_PERCENT", "50%")            # e.g. "50%"
+SLIPPAGE         = int(os.getenv("SLIPPAGE", "10"))
+PRIORITY_FEE     = float(os.getenv("PRIORITY_FEE", "0.00005"))
+CYCLE_SECONDS    = int(os.getenv("CYCLE_SECONDS", "60"))
 
-# ─── Pump.fun price fetcher ────────────────────────────────────────────────────
-def get_token_price():
-    """Fetch current price of CTST from pump.fun API."""
+PUMPPORTAL_API   = "https://pumpportal.fun/api/trade-local"
+PUMP_FUN_API     = "https://frontend-api.pump.fun/coins"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def get_token_info():
+    """Fetch token info from pump.fun frontend API."""
     try:
-        url = f"https://frontend-api.pump.fun/coins/{MINT}"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        price = data.get("usd_market_cap", 0) / data.get("total_supply", 1)
-        volume = data.get("volume_24h", 0)
-        market_cap = data.get("usd_market_cap", 0)
+        r = requests.get(f"{PUMP_FUN_API}/{MINT}", timeout=10)
+        r.raise_for_status()
+        d = r.json()
         return {
-            "price": price,
-            "market_cap": market_cap,
-            "volume_24h": volume,
-            "name": data.get("name"),
-            "symbol": data.get("symbol"),
+            "name":       d.get("name", "Unknown"),
+            "symbol":     d.get("symbol", "???"),
+            "market_cap": d.get("usd_market_cap", 0),
+            "volume":     d.get("volume_24h", 0),
+            # Price approximation from market cap / supply
+            "price":      d.get("usd_market_cap", 0) / max(d.get("total_supply", 1), 1),
         }
     except Exception as e:
-        log.error(f"Price fetch error: {e}")
+        log.error(f"Token info fetch failed: {e}")
         return None
 
-def get_sol_balance(client, pubkey):
-    """Get SOL balance of wallet."""
-    try:
-        resp = client.get_balance(pubkey)
-        return resp.value / 1e9  # lamports to SOL
-    except Exception as e:
-        log.error(f"Balance fetch error: {e}")
-        return 0
 
-# ─── Strategy ─────────────────────────────────────────────────────────────────
+def get_sol_balance(client: Client, pubkey) -> float:
+    """Return wallet SOL balance."""
+    try:
+        return client.get_balance(pubkey).value / 1e9
+    except Exception as e:
+        log.error(f"Balance check failed: {e}")
+        return 0.0
+
+
+def trade(keypair: Keypair, client: Client, action: str, amount) -> bool:
+    """
+    Execute a buy or sell via PumpPortal local trade API.
+    action: "buy" or "sell"
+    amount: SOL float for buy, or "50%" string for sell
+    """
+    try:
+        payload = {
+            "publicKey":        str(keypair.pubkey()),
+            "action":           action,
+            "mint":             MINT,
+            "denominatedInSol": "true" if action == "buy" else "false",
+            "amount":           amount,
+            "slippage":         SLIPPAGE,
+            "priorityFee":      PRIORITY_FEE,
+            "pool":             "pump",
+        }
+        # PumpPortal returns a serialized transaction
+        resp = requests.post(
+            PUMPPORTAL_API,
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.error(f"PumpPortal error {resp.status_code}: {resp.text}")
+            return False
+
+        # Deserialize, sign, and send
+        tx_bytes = base58.b58decode(resp.content)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        tx.sign([keypair])
+
+        sig = client.send_raw_transaction(
+            bytes(tx),
+            opts=TxOpts(skip_preflight=True, preflight_commitment="confirmed"),
+        )
+        log.info(f"✅ {action.upper()} tx sent: https://solscan.io/tx/{sig.value}")
+        return True
+
+    except Exception as e:
+        log.error(f"Trade error ({action}): {e}")
+        return False
+
+
+# ─── Bot ──────────────────────────────────────────────────────────────────────
 class MarketMaker:
     def __init__(self):
-        self.client = Client(RPC_URL)
-        self.keypair = Keypair.from_base58_string(PRIVATE_KEY)
-        self.pubkey = self.keypair.pubkey()
+        self.client   = Client(RPC_URL)
+        self.keypair  = Keypair.from_base58_string(PRIVATE_KEY)
+        self.pubkey   = self.keypair.pubkey()
         self.buy_price = None
-        self.cycle = 0
-        log.info(f"🤖 Bot wallet: {self.pubkey}")
-        log.info(f"🪙 Token: {MINT}")
-        log.info(f"💰 Buy amount: {BUY_AMOUNT_SOL} SOL | Profit target: {PROFIT_TARGET}%")
+        self.cycle     = 0
+        log.info(f"🤖 Bot wallet  : {self.pubkey}")
+        log.info(f"🪙  Token       : {MINT}")
+        log.info(f"⚙️  Buy {BUY_AMOUNT_SOL} SOL | Target +{PROFIT_TARGET}% | Stop -{STOP_LOSS}%")
 
     def run(self):
-        log.info("🚀 CTST Market Maker Bot started!")
+        log.info("🚀 CTST Market Maker started!\n")
         while True:
             try:
                 self.cycle += 1
-                log.info(f"\n{'='*50}")
-                log.info(f"📊 Cycle #{self.cycle} — {datetime.now().strftime('%H:%M:%S')}")
+                log.info(f"{'='*55}")
+                log.info(f"📊 Cycle #{self.cycle}  {datetime.now().strftime('%H:%M:%S')}")
 
-                # Check SOL balance
-                sol_balance = get_sol_balance(self.client, self.pubkey)
-                log.info(f"💳 Wallet SOL balance: {sol_balance:.4f} SOL")
+                sol_bal = get_sol_balance(self.client, self.pubkey)
+                log.info(f"💳 SOL balance : {sol_bal:.4f}")
 
-                if sol_balance < 0.002:
-                    log.warning("⚠️  Low SOL balance! Need at least 0.002 SOL. Waiting...")
-                    time.sleep(CYCLE_SECONDS * 2)
+                # Safety: keep at least 0.005 SOL for fees
+                if sol_bal < 0.007:
+                    log.warning("⚠️  Low balance! Waiting for top-up...")
+                    time.sleep(CYCLE_SECONDS * 3)
                     continue
 
-                # Fetch token price
-                info = get_token_price()
+                info = get_token_info()
                 if not info:
-                    log.warning("Could not fetch price, skipping cycle.")
                     time.sleep(CYCLE_SECONDS)
                     continue
 
-                current_price = info["price"]
-                log.info(f"📈 {info['name']} (${info['symbol']}) | Market Cap: ${info['market_cap']:.2f} | Volume 24h: ${info['volume_24h']:.2f}")
+                log.info(f"📈 {info['name']} (${info['symbol']}) | "
+                         f"MCap ${info['market_cap']:.2f} | "
+                         f"Vol ${info['volume']:.2f}")
 
-                # ── Decision logic ──────────────────────────────────────────
+                # ── Strategy ──────────────────────────────────────────────
                 if self.buy_price is None:
-                    # First cycle: BUY to support the token
-                    log.info(f"🟢 BUY signal — buying {BUY_AMOUNT_SOL} SOL worth of CTST")
-                    try:
-                        buy(
-                            self.client,
-                            self.keypair,
-                            MINT,
-                            BUY_AMOUNT_SOL,
-                            SLIPPAGE,
-                            UNIT_BUDGET,
-                            UNIT_PRICE
-                        )
-                        self.buy_price = current_price
-                        log.info(f"✅ Bought at price: {self.buy_price:.8f}")
-                    except Exception as e:
-                        log.error(f"❌ Buy failed: {e}")
+                    # No position — BUY
+                    log.info(f"🟢 Opening position: buying {BUY_AMOUNT_SOL} SOL of $CTST...")
+                    success = trade(self.keypair, self.client, "buy", BUY_AMOUNT_SOL)
+                    if success:
+                        self.buy_price = info["price"]
+                        log.info(f"📌 Entry price recorded: {self.buy_price:.10f}")
 
                 else:
-                    # Check if profit target hit
                     if self.buy_price > 0:
-                        gain_pct = ((current_price - self.buy_price) / self.buy_price) * 100
-                        log.info(f"📉 P&L since last buy: {gain_pct:+.2f}%")
+                        pnl = ((info["price"] - self.buy_price) / self.buy_price) * 100
+                        log.info(f"📉 P&L: {pnl:+.2f}%")
 
-                        if gain_pct >= PROFIT_TARGET:
-                            log.info(f"🎯 Profit target hit ({gain_pct:.1f}%)! Selling {SELL_PERCENT}% of tokens...")
-                            try:
-                                sell(
-                                    self.client,
-                                    self.keypair,
-                                    MINT,
-                                    SELL_PERCENT,
-                                    SLIPPAGE,
-                                    UNIT_BUDGET,
-                                    UNIT_PRICE
-                                )
-                                log.info(f"✅ Sold {SELL_PERCENT}% of holdings")
-                                self.buy_price = None  # Reset, will rebuy next cycle
-                            except Exception as e:
-                                log.error(f"❌ Sell failed: {e}")
+                        if pnl >= PROFIT_TARGET:
+                            log.info(f"🎯 Profit target hit! Selling {SELL_PERCENT}...")
+                            success = trade(self.keypair, self.client, "sell", SELL_PERCENT)
+                            if success:
+                                self.buy_price = None  # Reset — will rebuy next cycle
 
-                        elif gain_pct <= -30:
-                            # Stop loss at -30%
-                            log.warning(f"🛑 Stop loss triggered ({gain_pct:.1f}%)! Selling to protect capital...")
-                            try:
-                                sell(self.client, self.keypair, MINT, 100, SLIPPAGE, UNIT_BUDGET, UNIT_PRICE)
-                                log.info("✅ Stop loss sell executed")
+                        elif pnl <= -STOP_LOSS:
+                            log.warning(f"🛑 Stop loss hit! Selling 100% to protect capital...")
+                            success = trade(self.keypair, self.client, "sell", "100%")
+                            if success:
                                 self.buy_price = None
-                            except Exception as e:
-                                log.error(f"❌ Stop loss sell failed: {e}")
 
                         else:
-                            log.info(f"⏳ Holding... waiting for {PROFIT_TARGET}% target")
+                            log.info(f"⏳ Holding... target: +{PROFIT_TARGET}% | stop: -{STOP_LOSS}%")
 
             except KeyboardInterrupt:
-                log.info("🛑 Bot stopped by user.")
+                log.info("🛑 Stopped by user.")
                 break
             except Exception as e:
-                log.error(f"Unexpected error in cycle: {e}")
+                log.error(f"Unexpected error: {e}")
 
-            log.info(f"💤 Sleeping {CYCLE_SECONDS}s until next cycle...")
+            log.info(f"💤 Next cycle in {CYCLE_SECONDS}s...")
             time.sleep(CYCLE_SECONDS)
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    bot = MarketMaker()
-    bot.run()
+    MarketMaker().run()
