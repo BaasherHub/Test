@@ -101,7 +101,7 @@ def trade(keypair: Keypair, client: Client, action: str, amount) -> bool:
             log.error(f"PumpPortal {resp.status_code}: {resp.text}")
             return False
 
-        tx_bytes = base58.b58decode(resp.content)
+        tx_bytes = resp.content
         tx = VersionedTransaction.from_bytes(tx_bytes)
         tx.sign([keypair])
         sig = client.send_raw_transaction(
