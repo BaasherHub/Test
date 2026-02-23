@@ -1,189 +1,180 @@
-"""
-CTST (Claude Test) Market Maker Bot
-Token: 7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump
-Uses PumpPortal API for trading + DexScreener API for price data
-"""
-
 import os
-import json
-import time
-import base58
-import requests
+import asyncio
+import aiohttp
 import logging
-from datetime import datetime
-from solana.rpc.api import Client
-from solana.rpc.types import TxOpts
-from solders.keypair import Keypair  # type: ignore
-from solders.transaction import VersionedTransaction  # type: ignore
+from telegram import Bot
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log")
-    ]
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-PRIVATE_KEY_RAW = os.environ["PRIVATE_KEY"]   # Comma-separated bytes or Base58
-RPC_URL         = os.environ["RPC_URL"]
-MINT            = "7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+MIN_LIQUIDITY = float(os.environ.get("MIN_LIQUIDITY", "1000"))  # Default $1,000
 
-BUY_AMOUNT_SOL  = float(os.getenv("BUY_AMOUNT_SOL", "0.005"))
-PROFIT_TARGET   = float(os.getenv("PROFIT_TARGET", "20"))
-STOP_LOSS       = float(os.getenv("STOP_LOSS", "30"))
-SELL_PERCENT    = os.getenv("SELL_PERCENT", "50%")
-SLIPPAGE        = int(os.getenv("SLIPPAGE", "10"))
-PRIORITY_FEE    = float(os.getenv("PRIORITY_FEE", "0.00005"))
-CYCLE_SECONDS   = int(os.getenv("CYCLE_SECONDS", "60"))
+seen_pairs: set[str] = set()
+is_first_run: bool = True
 
-PUMPPORTAL_API  = "https://pumpportal.fun/api/trade-local"
-DEXSCREENER_API = f"https://api.dexscreener.com/latest/dex/tokens/{MINT}"
 
-# ─── Keypair loader ───────────────────────────────────────────────────────────
-def load_keypair(raw: str) -> Keypair:
-    raw = raw.strip()
-    if raw.startswith("["):
-        return Keypair.from_bytes(bytes(json.loads(raw)))
-    elif "," in raw:
-        return Keypair.from_bytes(bytes([int(x.strip()) for x in raw.split(",")]))
-    else:
-        return Keypair.from_base58_string(raw)
+def format_number(value: float) -> str:
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    elif value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    return f"${value:.2f}"
 
-# ─── Price via DexScreener ────────────────────────────────────────────────────
-def get_token_info():
+
+async def check_liquidity_locked(session: aiohttp.ClientSession, token_address: str) -> tuple[bool, str]:
+    """Check if liquidity is locked via Rugcheck API. Returns (is_locked, detail_string)."""
     try:
-        r = requests.get(DEXSCREENER_API, timeout=10)
-        r.raise_for_status()
-        pairs = r.json().get("pairs")
-        if not pairs:
-            log.warning("No pairs on DexScreener yet — token may have no trades.")
-            return None
-        pair = sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0)), reverse=True)[0]
-        return {
-            "name":            pair.get("baseToken", {}).get("name", "CTST"),
-            "symbol":          pair.get("baseToken", {}).get("symbol", "CTST"),
-            "price":           float(pair.get("priceUsd") or 0),
-            "market_cap":      float(pair.get("fdv") or 0),
-            "volume":          float((pair.get("volume") or {}).get("h24", 0)),
-            "price_change_1h": float((pair.get("priceChange") or {}).get("h1", 0)),
-        }
+        url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return False, "❓ Unknown"
+            data = await resp.json()
+            risks = data.get("risks", [])
+            lp_unlocked = any("unlocked" in r.get("name", "").lower() for r in risks)
+            lp_locked = any("locked" in r.get("name", "").lower() for r in risks)
+
+            if lp_locked:
+                return True, "🔒 Locked"
+            elif lp_unlocked:
+                return False, "🔓 Unlocked"
+            else:
+                return False, "❓ Unknown"
     except Exception as e:
-        log.error(f"DexScreener fetch failed: {e}")
-        return None
+        logger.warning(f"Rugcheck lookup failed for {token_address}: {e}")
+        return False, "❓ Unknown"
 
-# ─── SOL balance ──────────────────────────────────────────────────────────────
-def get_sol_balance(client: Client, pubkey) -> float:
+
+def build_alert_message(pair: dict, lp_lock_status: str) -> str:
+    token_name = pair.get("baseToken", {}).get("name", "Unknown")
+    token_symbol = pair.get("baseToken", {}).get("symbol", "???")
+    token_address = pair.get("baseToken", {}).get("address", "")
+    dex_id = pair.get("dexId", "Unknown DEX").capitalize()
+    liquidity = pair.get("liquidity", {}).get("usd", 0)
+    pair_address = pair.get("pairAddress", "")
+    price_usd = pair.get("priceUsd", "N/A")
+
+    dex_link = f"https://dexscreener.com/solana/{pair_address}"
+    axiom_link = f"https://axiom.trade/t/{token_address}"
+
+    msg = (
+        f"🚨 <b>New Liquidity Added on Solana!</b>\n\n"
+        f"🪙 <b>Token:</b> {token_name} (${token_symbol})\n"
+        f"📋 <b>Address:</b> <code>{token_address}</code>\n"
+        f"🏦 <b>DEX:</b> {dex_id}\n"
+        f"💧 <b>Liquidity:</b> {format_number(liquidity)}\n"
+        f"🔐 <b>LP Lock:</b> {lp_lock_status}\n"
+        f"💰 <b>Price:</b> ${price_usd}\n\n"
+        f"🔗 <a href='{dex_link}'>DexScreener</a>  |  ⚡ <a href='{axiom_link}'>Axiom</a>"
+    )
+    return msg
+
+
+async def fetch_latest_solana_tokens(session: aiohttp.ClientSession) -> list[dict]:
     try:
-        return client.get_balance(pubkey).value / 1e9
+        url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                logger.warning(f"Token profiles returned {resp.status}")
+                return []
+            data = await resp.json()
+            solana_tokens = [t for t in data if t.get("chainId") == "solana"]
+            logger.info(f"Found {len(solana_tokens)} Solana token profiles.")
+            return solana_tokens
     except Exception as e:
-        log.error(f"Balance check failed: {e}")
-        return 0.0
+        logger.error(f"Error fetching token profiles: {e}")
+        return []
 
-# ─── Trade via PumpPortal ─────────────────────────────────────────────────────
-def trade(keypair: Keypair, client: Client, action: str, amount) -> bool:
+
+async def fetch_pairs_for_token(session: aiohttp.ClientSession, address: str) -> list[dict]:
     try:
-        payload = {
-            "publicKey":        str(keypair.pubkey()),
-            "action":           action,
-            "mint":             MINT,
-            "denominatedInSol": "true" if action == "buy" else "false",
-            "amount":           amount,
-            "slippage":         SLIPPAGE,
-            "priorityFee":      PRIORITY_FEE,
-            "pool":             "pump",
-        }
-        resp = requests.post(PUMPPORTAL_API, json=payload, timeout=15)
-        if resp.status_code != 200:
-            log.error(f"PumpPortal {resp.status_code}: {resp.text}")
-            return False
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            return data.get("pairs") or []
+    except Exception as e:
+        logger.error(f"Error fetching pairs for {address}: {e}")
+        return []
 
-        tx_bytes = resp.content
-        tx = VersionedTransaction.from_bytes(tx_bytes)
-        signed_tx = VersionedTransaction(tx.message, [keypair])
-        sig = client.send_raw_transaction(
-            bytes(signed_tx),
-            opts=TxOpts(skip_preflight=True, preflight_commitment="confirmed"),
+
+async def send_alert(bot: Bot, message: str):
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
         )
-        log.info(f"✅ {action.upper()} sent → https://solscan.io/tx/{sig.value}")
-        return True
-    except Exception as e:
-        log.error(f"Trade error ({action}): {e}")
-        return False
+        logger.info("Alert sent.")
+    except TelegramError as e:
+        logger.error(f"Failed to send Telegram message: {e}")
 
-# ─── Bot ──────────────────────────────────────────────────────────────────────
-class MarketMaker:
-    def __init__(self):
-        self.client    = Client(RPC_URL)
-        self.keypair   = load_keypair(PRIVATE_KEY_RAW)
-        self.pubkey    = self.keypair.pubkey()
-        self.buy_price = None
-        self.cycle     = 0
-        log.info(f"🤖 Wallet  : {self.pubkey}")
-        log.info(f"🪙  Token   : {MINT}")
-        log.info(f"⚙️  Buy {BUY_AMOUNT_SOL} SOL | Target +{PROFIT_TARGET}% | Stop -{STOP_LOSS}%")
 
-    def run(self):
-        log.info("🚀 CTST Market Maker started!\n")
+async def monitor(bot: Bot):
+    global is_first_run
+    logger.info(f"🔭 Solana Liquidity Radar started. Min liquidity: ${MIN_LIQUIDITY:,.0f}")
+
+    async with aiohttp.ClientSession() as session:
         while True:
-            try:
-                self.cycle += 1
-                log.info(f"{'='*55}")
-                log.info(f"📊 Cycle #{self.cycle}  {datetime.now().strftime('%H:%M:%S')}")
+            tokens = await fetch_latest_solana_tokens(session)
+            new_alerts = 0
 
-                sol_bal = get_sol_balance(self.client, self.pubkey)
-                log.info(f"💳 SOL balance: {sol_bal:.4f}")
-
-                if sol_bal < 0.007:
-                    log.warning("⚠️  Low balance! Top up the bot wallet.")
-                    time.sleep(CYCLE_SECONDS * 3)
+            for token in tokens:
+                address = token.get("tokenAddress")
+                if not address:
                     continue
 
-                info = get_token_info()
-                if not info:
-                    log.info("⏳ No price data yet. Waiting...")
-                    time.sleep(CYCLE_SECONDS)
-                    continue
+                pairs = await fetch_pairs_for_token(session, address)
 
-                log.info(
-                    f"📈 {info['name']} | Price: ${info['price']:.8f} | "
-                    f"MCap: ${info['market_cap']:.0f} | "
-                    f"Vol 24h: ${info['volume']:.0f} | "
-                    f"1h: {info['price_change_1h']:+.1f}%"
-                )
+                for pair in pairs:
+                    pair_address = pair.get("pairAddress")
+                    if not pair_address:
+                        continue
 
-                if self.buy_price is None:
-                    log.info(f"🟢 No position. Buying {BUY_AMOUNT_SOL} SOL of $CTST...")
-                    if trade(self.keypair, self.client, "buy", BUY_AMOUNT_SOL):
-                        self.buy_price = info["price"]
-                        log.info(f"📌 Entry price: ${self.buy_price:.8f}")
-                else:
-                    pnl = ((info["price"] - self.buy_price) / self.buy_price) * 100
-                    log.info(f"📉 P&L since entry: {pnl:+.2f}%")
+                    if pair_address in seen_pairs:
+                        continue
 
-                    if pnl >= PROFIT_TARGET:
-                        log.info(f"🎯 +{PROFIT_TARGET}% hit! Selling {SELL_PERCENT}...")
-                        if trade(self.keypair, self.client, "sell", SELL_PERCENT):
-                            self.buy_price = None
-                    elif pnl <= -STOP_LOSS:
-                        log.warning(f"🛑 Stop loss -{STOP_LOSS}% hit. Selling 100%...")
-                        if trade(self.keypair, self.client, "sell", "100%"):
-                            self.buy_price = None
-                    else:
-                        log.info(f"⏳ Holding. Target: +{PROFIT_TARGET}% | Stop: -{STOP_LOSS}%")
+                    seen_pairs.add(pair_address)
 
-            except KeyboardInterrupt:
-                log.info("🛑 Stopped.")
-                break
-            except Exception as e:
-                log.error(f"Unexpected error: {e}")
+                    if is_first_run:
+                        continue
 
-            log.info(f"💤 Sleeping {CYCLE_SECONDS}s...\n")
-            time.sleep(CYCLE_SECONDS)
+                    liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
+                    if liquidity < MIN_LIQUIDITY:
+                        logger.info(f"Skipping {pair_address} — liquidity ${liquidity:.0f} below minimum")
+                        continue
+
+                    _, lp_lock_status = await check_liquidity_locked(session, address)
+
+                    msg = build_alert_message(pair, lp_lock_status)
+                    await send_alert(bot, msg)
+                    new_alerts += 1
+                    await asyncio.sleep(1)
+
+            if is_first_run:
+                logger.info(f"First run complete. Seeded {len(seen_pairs)} existing pairs. Now watching for NEW pairs...")
+                is_first_run = False
+            else:
+                logger.info(f"Cycle complete. Sent {new_alerts} alerts. Watching {len(seen_pairs)} pairs. Sleeping {POLL_INTERVAL}s...")
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    me = await bot.get_me()
+    logger.info(f"Bot started as @{me.username}")
+    await monitor(bot)
 
 
 if __name__ == "__main__":
-    MarketMaker().run()
+    asyncio.run(main())
