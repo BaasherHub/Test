@@ -103,9 +103,9 @@ def trade(keypair: Keypair, client: Client, action: str, amount) -> bool:
 
         tx_bytes = resp.content
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        tx.sign([keypair])
+        signed_tx = VersionedTransaction(tx.message, [keypair])
         sig = client.send_raw_transaction(
-            bytes(tx),
+            bytes(signed_tx),
             opts=TxOpts(skip_preflight=True, preflight_commitment="confirmed"),
         )
         log.info(f"✅ {action.upper()} sent → https://solscan.io/tx/{sig.value}")
