@@ -27,7 +27,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-PRIVATE_KEY      = os.environ["PRIVATE_KEY"]   # Base58 private key of bot wallet
+PRIVATE_KEY_RAW  = os.environ["PRIVATE_KEY"]   # Accepts Base58 string OR JSON array like [1,2,3,...]
 RPC_URL          = os.environ["RPC_URL"]        # Helius or QuickNode RPC URL
 MINT             = "7iqfFVKnZfDGoZTSwskSWtjHHtVKNft296pSd38rpump"
 
@@ -40,6 +40,22 @@ PRIORITY_FEE     = float(os.getenv("PRIORITY_FEE", "0.00005"))
 CYCLE_SECONDS    = int(os.getenv("CYCLE_SECONDS", "60"))
 
 PUMPPORTAL_API   = "https://pumpportal.fun/api/trade-local"
+
+def load_keypair(raw: str) -> Keypair:
+    """Load keypair from either Base58 string or JSON byte array format."""
+    raw = raw.strip()
+    if raw.startswith("["):
+        # JSON array format: [1,2,3,...]
+        import json
+        byte_list = json.loads(raw)
+        return Keypair.from_bytes(bytes(byte_list))
+    elif "," in raw:
+        # Comma-separated without brackets: 1,2,3,...
+        byte_list = [int(x.strip()) for x in raw.split(",")]
+        return Keypair.from_bytes(bytes(byte_list))
+    else:
+        # Base58 string
+        return Keypair.from_base58_string(raw)
 PUMP_FUN_API     = "https://frontend-api.pump.fun/coins"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -120,7 +136,7 @@ def trade(keypair: Keypair, client: Client, action: str, amount) -> bool:
 class MarketMaker:
     def __init__(self):
         self.client   = Client(RPC_URL)
-        self.keypair  = Keypair.from_base58_string(PRIVATE_KEY)
+        self.keypair  = load_keypair(PRIVATE_KEY_RAW)
         self.pubkey   = self.keypair.pubkey()
         self.buy_price = None
         self.cycle     = 0
